@@ -18,9 +18,10 @@ audiomix/
   timeline.py    时间轴编辑器（整笔校验、点查询、不可变发布产品）
   engine.py      混音引擎：逐样本参考解释器 + 等价的 NumPy 分块向量化渲染
   archive.py     混音数据仓：内容寻址块存储 + SQLite 依赖索引 + 增量渲染 + 读取/追溯
+  faders.py      推子联动 + 双播出配方 + 检查窗约束 + 最少成本校正单/无解分类
   cli.py         命令行入口
-tests/           手算案例、数据仓案例、边界语义测试
-demo/            30 素材/100 clip/120s 规模案例与 CLI 端到端走查
+tests/           手算案例、数据仓案例、边界语义、推子联动测试
+demo/            30 素材/100 clip/120s 规模案例、推子联动演示与 CLI 端到端走查
 run_all_checks.sh 一键全量验证
 ```
 
@@ -82,9 +83,60 @@ python3 -m audiomix.cli read  --archive-root DIR/archive --render-id r1 --start 
 python3 -m audiomix.cli trace --archive-root DIR/archive --render-id r1 --start 0 --end 3200
 python3 -m audiomix.cli export-wav --archive-root DIR/archive --render-id r1 --out out.wav
 python3 -m audiomix.cli verify-integrity --archive-root DIR/archive
+
+# 推子联动 / 双播出配方（在发布产品之上，全部精确有理数）
+python3 -m audiomix.cli fader-contrib --spec faders.json --registry-root DIR/registry \
+    --recipe jia --n0 0 --n1 1600     # 检查窗内各推子舍入前/饱和前贡献
+python3 -m audiomix.cli fader-solve   --spec faders.json --registry-root DIR/registry
+python3 -m audiomix.cli fader-correct --spec faders.json --registry-root DIR/registry \
+    --out correction.json             # 最少人工成本校正单 + 两份真实 WAV
+python3 -m audiomix.cli fader-explain --spec faders.json --registry-root DIR/registry
+                                      # 无解时区分单套/合办并列出互相排斥的检查
 ```
 
-完整端到端示例：`bash demo/cli_walkthrough.sh`；全量验证：`bash run_all_checks.sh`。
+完整端到端示例：`bash demo/cli_walkthrough.sh`；推子联动演示：
+`python3 -m demo.fader_demo`；全量验证：`bash run_all_checks.sh`。
+
+## 推子联动与双播出配方（`audiomix/faders.py`）
+
+在既有不可变发布产品之上再叠一层“稳定 clip 联动关系”。产品与素材字节仍是
+唯一的实播依据，联动规格（`audiomix.faders/1`）单独保存：
+
+```jsonc
+{
+  "format": "audiomix.faders/1", "T": "1/16000",
+  "product": "product.json",            // 或直接内嵌 "product_body": {…}
+  "faders": [                            // 每支推子：有限精确有理增益档 + 人工成本
+    {"fader_id": "f1", "current": "full", "costs": {"half": "1"},
+     "positions": [{"id": "full", "gain": "1"}, {"id": "half", "gain": "1/2"}]}
+  ],
+  "linkage": {"clip_p": "f1", "clip_n": "f2"},   // 共用推子 => 必须同档；同素材可分属不同推子
+  "recipes": {                           // 两套单声道播出配方：参与的 clip + 有理配重
+    "jia": [{"clip_id": "clip_p", "weight": "1"}, {"clip_id": "clip_n", "weight": "1"}],
+    "yi":  [{"clip_id": "clip_p", "weight": "1"}]
+  },
+  "constraints": [                       // 检查窗（左闭右开样本区间）
+    {"id": "jia", "recipe": "jia", "kind": "interval",  "n0": 0, "n1": 1, "lo": "0", "hi": "30"},
+    {"id": "yi",  "recipe": "yi",  "kind": "lower_sum", "n0": 0, "n1": 1, "lower": 60}
+  ]
+}
+```
+
+- **联动关系登记在 clip 上**：若两次出现共用一个推子则选同一档；同一素材可由
+  不同推子独立控制（同一 asset 可有多个 clip 分属不同推子）。
+- **贡献可独立给出**：`fader-contrib` / `window_contributions` 返回检查窗内每支
+  推子对左右两套配方各自的“舍入前、饱和前”精确有理贡献，以及合成值与出带整数。
+- **两套检查窗、同一档位方案**：`interval` 约束未饱和合成值逐样本落在闭区间；
+  `lower_sum` 约束实际出带整数样本之和达到下限。同一推子方案必须两套都过。
+- **最少人工成本**：`fader-solve` / `fader-correct` 求全局最小成本档位方案
+  （精确 DP，等价状态合并；超大规模回退精确分支定界），并列最优取其一。
+- **合同不变**：贡献仍含原有速度/淡化/末样本保持；所有 clip 浮点/有理贡献先
+  求和，再做唯一一次“恰半取偶”舍入，最后饱和。校验与渲染都走精确 `Fraction`，
+  与既有 `engine` 参考解释器逐样本一致（见 `tests/test_faders.py`）。
+- **保存前重做核对**：`fader-correct` 先用原始素材字节 + 所选档位，在全新对象上
+  重做两套实播核对，通过后才写校正单与两份真实 16kHz WAV。
+- **无解分类**：`fader-explain` 区分 `single_recipe_infeasible`（单套本就不可行）
+  与 `joint_only_infeasible`（两套各自可行、合办才无解），并给出互相排斥的实际检查。
 
 ## 验证策略（不使用任何外部混音结果）
 
@@ -98,6 +150,13 @@ python3 -m audiomix.cli verify-integrity --archive-root DIR/archive
   “先求和后单次舍入”与“逐片段先舍入”的语义区分。
 - `demo/scale_demo.py`：30 素材（每采样率 10 个）、100 clip、120 秒/192 万样本，
   含全部要求情形；窗口化逐样本交叉核对，输出 WAV、块峰值、削顶数与来源索引。
+- `tests/test_faders.py`：题面手算示例（两支降半档 => 甲 10/乙 50；仅压第一支
+  => 甲 -30；放宽乙后原档成本 0）、推子层与既有引擎参考逐样本一致（速度/淡化/
+  末样本保持/单次舍入）、两套配方共用方案、相消依赖、`lower_sum` 实际整数和、
+  `joint_only_infeasible` 分类与互相排斥检查、旧播 WAV 相同而联动分组不同
+  （一份可修/一份无解）、并列最优、从原始素材重做核对往返。
+- `demo/fader_demo.py`：上述手算示例、双配方贡献、真实 WAV 输出与不可行分类的
+  端到端走查（等价状态合并 DP 对 18 支全耦合推子亦为毫秒级）。
 
 参考解释器（`engine.render_reference`）是独立的纯 Python 逐样本 Fraction 实现，
 与向量化渲染路径代码完全分开，仅共享产品装载/校验，作为语义基准。

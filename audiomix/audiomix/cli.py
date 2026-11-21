@@ -18,6 +18,9 @@ from .engine import (
 )
 from .rationals import as_r, dump_r
 from .timeline import TimelineEditor, ValidationError
+from .faders import (
+    FaderError, load_fader_program, write_recipe_wav,
+)
 
 
 def _print(obj) -> None:
@@ -232,6 +235,96 @@ def cmd_render_compare(p):
             "identical": bool(mismatch == 0)})
 
 
+# ----------------------------- 推子联动命令 ----------------------------- #
+
+def _parse_assignment(p) -> dict[str, str] | None:
+    if not getattr(p, "set", None):
+        return None
+    result = {}
+    for item in p.set:
+        fid, pid = item.split("=", 1)
+        result[fid.strip()] = pid.strip()
+    return result
+
+
+def _program(p):
+    return load_fader_program(p.spec, p.registry_root)
+
+
+def cmd_fader_contrib(p):
+    fp = _program(p)
+    n0 = int(p.n0) if p.n0 is not None else 0
+    n1 = int(p.n1) if p.n1 is not None else fp.N
+    recipes = [p.recipe] if p.recipe else sorted(fp.recipes)
+    report = {r: fp.window_contributions(r, n0, n1, _parse_assignment(p))
+              for r in recipes}
+    _print({"window": [n0, n1], "recipes": report})
+
+
+def cmd_fader_solve(p):
+    fp = _program(p)
+    res = fp.solve(minimize_cost=not p.feasible_only)
+    out = {
+        "feasible": res["feasible"],
+        "minimized": not p.feasible_only,
+    }
+    if res["feasible"]:
+        out.update({
+            "total_cost": dump_r(res["cost"]),
+            "assignment": dict(sorted(res["assignment"].items())),
+            "changes": fp.correction_report(res["assignment"])["changes"],
+        })
+    else:
+        out["explanation"] = fp.explain_infeasible()
+    _print(out)
+    if not res["feasible"]:
+        sys.exit(3)
+
+
+def cmd_fader_correct(p):
+    """求解 -> 用原始素材按所选档位重做两套实播核对 -> 写校正单与两份 WAV。"""
+    import os
+    fp = _program(p)
+    res = fp.solve(minimize_cost=not p.feasible_only)
+    if not res["feasible"]:
+        _print({"feasible": False, "explanation": fp.explain_infeasible()})
+        sys.exit(3)
+    assignment = res["assignment"]
+    # 保存前必须用原始素材重做两套实播核对
+    verify = fp.verify_from_pcm(assignment)
+    if not verify["ok"]:
+        _print({"feasible": True, "verified": False,
+                "error": "重做实播核对未通过，拒绝保存",
+                "assignment": dict(sorted(assignment.items())),
+                "checks": verify["checks"]})
+        sys.exit(4)
+
+    os.makedirs(os.path.dirname(os.path.abspath(p.out)) or ".", exist_ok=True)
+    wav_paths = {}
+    for name, info in verify["per_recipe"].items():
+        path = os.path.join(os.path.dirname(os.path.abspath(p.out)),
+                            f"{p.wav_prefix}{name}.wav")
+        write_recipe_wav(path, info["samples"])
+        wav_paths[name] = path
+
+    report = fp.correction_report(assignment, wav_paths=wav_paths, verified=True)
+    with open(p.out, "w", encoding="utf-8") as fh:
+        json.dump(report, fh, ensure_ascii=False, indent=2)
+    _print({"feasible": True, "verified": True, "correction": p.out,
+            "total_cost": report["total_cost"], "changes": report["changes"],
+            "wav": wav_paths, "checks": report["checks"]})
+
+
+def cmd_fader_explain(p):
+    fp = _program(p)
+    res = fp.solve(minimize_cost=False)
+    if res["feasible"]:
+        _print({"feasible": True})
+        return
+    _print(fp.explain_infeasible())
+    sys.exit(3)
+
+
 # ----------------------------- 参数解析 ----------------------------- #
 
 def build_parser() -> argparse.ArgumentParser:
@@ -329,6 +422,32 @@ def build_parser() -> argparse.ArgumentParser:
     q = sub.add_parser("render-compare"); q.add_argument("--product", required=True)
     q.add_argument("--registry-root", required=True); q.add_argument("--T", required=True)
     q.set_defaults(fn=cmd_render_compare)
+
+    # ---- 推子联动：检查窗贡献 / 求最优校正 / 写入校正单与两份 WAV / 解释无解 ---- #
+    def fader_parser(name, fn, with_set=True):
+        q = sub.add_parser(name)
+        q.add_argument("--spec", required=True, help="联动规格 JSON")
+        q.add_argument("--registry-root", required=True)
+        if with_set:
+            q.add_argument("--set", action="append", default=None,
+                           help="fader=position，可多次；缺省为当前档")
+        q.set_defaults(fn=fn)
+        return q
+
+    q = fader_parser("fader-contrib", cmd_fader_contrib)
+    q.add_argument("--recipe", help="只报该配方，缺省两套都报")
+    q.add_argument("--n0", default=None); q.add_argument("--n1", default=None)
+
+    q = fader_parser("fader-solve", cmd_fader_solve)
+    q.add_argument("--feasible-only", dest="feasible_only", action="store_true",
+                   help="只要一个可行解，不最小化成本")
+
+    q = fader_parser("fader-correct", cmd_fader_correct)
+    q.add_argument("--out", required=True, help="校正单 JSON 输出路径")
+    q.add_argument("--wav-prefix", dest="wav_prefix", default="recipe_")
+    q.add_argument("--feasible-only", dest="feasible_only", action="store_true")
+
+    q = fader_parser("fader-explain", cmd_fader_explain, with_set=False)
 
     return ap
 

@@ -65,4 +65,51 @@ $PY verify-product --product "$ROOT/external_product.json" --registry-root "$REG
 $PY render --archive-root "$ARCH" --product "$ROOT/external_product.json" \
            --registry-root "$REG" --T 1/1000 --render-id walk-external
 $PY verify-integrity --archive-root "$ARCH"
+
+echo "== 11. 推子联动：双配方检查窗贡献 / 最优校正单 + 两份真实 WAV =="
+FR="$ROOT/fader"
+rm -rf "$FR"; mkdir -p "$FR"
+# 用短序列现搭一份手算节目：p=+100、n=-80
+FP=$($PY asset-seq --root "$REG" --rate 16000 --values 100 --note plus | python3 -c 'import sys,json;print(json.load(sys.stdin)["asset_id"])')
+FN=$($PY asset-seq --root "$REG" --rate 16000 --values -80 --note minus | python3 -c 'import sys,json;print(json.load(sys.stdin)["asset_id"])')
+$PY tl-insert --root "$REG" --name fader --clip-id p --asset-id "$FP" --a 0 --b 1 --start 0 >/dev/null
+$PY tl-insert --root "$REG" --name fader --clip-id n --asset-id "$FN" --a 0 --b 1 --start 0 >/dev/null
+$PY tl-publish --root "$REG" --name fader --out "$FR/product.json" >/dev/null
+python3 - "$FR" <<'PYEOF'
+import json, sys
+fr = sys.argv[1]
+spec = {
+  "format": "audiomix.faders/1", "T": "1/16000", "product": "product.json",
+  "faders": [
+    {"fader_id": "f1", "current": "full", "costs": {"half": "1"},
+     "positions": [{"id": "full", "gain": "1"}, {"id": "half", "gain": "1/2"}]},
+    {"fader_id": "f2", "current": "full", "costs": {"half": "1"},
+     "positions": [{"id": "full", "gain": "1"}, {"id": "half", "gain": "1/2"}]},
+  ],
+  "linkage": {"p": "f1", "n": "f2"},
+  "recipes": {
+    "jia": [{"clip_id": "p", "weight": "1"}, {"clip_id": "n", "weight": "1"}],
+    "yi": [{"clip_id": "p", "weight": "1"}],
+  },
+  "constraints": [
+    {"id": "jia-win", "recipe": "jia", "kind": "interval", "n0": 0, "n1": 1, "lo": "0", "hi": "30"},
+    {"id": "yi-win", "recipe": "yi", "kind": "interval", "n0": 0, "n1": 1, "hi": "60"},
+  ],
+}
+json.dump(spec, open(fr + "/spec.json", "w"), ensure_ascii=False, indent=2)
+PYEOF
+echo "-- 舍入/饱和前各推子的独立贡献（当前档） --"
+$PY fader-contrib --spec "$FR/spec.json" --registry-root "$REG" --recipe jia \
+    | python3 -c 'import sys,json;d=json.load(sys.stdin)["recipes"]["jia"];print("  faders=",d["faders"],"composite=",d["composite"],"emitted=",d["emitted"])'
+echo "-- 最优校正单（甲[0,30]、乙<=60） --"
+$PY fader-correct --spec "$FR/spec.json" --registry-root "$REG" --out "$FR/correction.json" \
+    | python3 -c 'import sys,json;d=json.load(sys.stdin);print("  cost=",d["total_cost"],"changes=",d["changes"],"wav=",d["wav"])'
+python3 - "$FR" <<'PYEOF'
+import sys
+from audiomix.assets import read_wav
+fr = sys.argv[1]
+for name in ("jia", "yi"):
+    pcm, rate = read_wav(f"{fr}/recipe_{name}.wav")
+    print(f"  {name}.wav: {rate} Hz 样本={pcm.tolist()}")
+PYEOF
 echo "全部命令走查通过"

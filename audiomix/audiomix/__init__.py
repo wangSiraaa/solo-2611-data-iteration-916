@@ -6,10 +6,16 @@ from .engine import (
     validate_product, output_sample_count, BLOCK_SAMPLES, OUTPUT_RATE,
 )
 from .archive import ArchiveStore, block_key_of
+from .faders import (
+    Fader, FaderProgram, FaderError, Constraint, load_fader_program,
+    emit_fraction, write_recipe_wav,
+)
 
 __all__ = [
     "AssetRegistry", "TimelineEditor", "Clip", "ValidationError",
     "render_reference", "render_block", "render_full_vectorized",
     "validate_product", "output_sample_count", "BLOCK_SAMPLES", "OUTPUT_RATE",
     "ArchiveStore", "block_key_of",
+    "Fader", "FaderProgram", "FaderError", "Constraint", "load_fader_program",
+    "emit_fraction", "write_recipe_wav",
 ]
